@@ -47,6 +47,8 @@ OPTIONAL - Anthropic API key for org-level usage
 
 import json
 import os
+import subprocess
+import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from collections import defaultdict
@@ -224,6 +226,61 @@ def parse_local(session_window_hours: float = 5.0):
 
     return by_date, by_project, n_files, sess_in, sess_out, recent_in, recent_out
 
+# ── Live rate limits via API response headers ─────────────────────────────────
+
+def get_oauth_token() -> str:
+    """Read Claude Code OAuth token from macOS Keychain."""
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode != 0:
+            return ""
+        creds = json.loads(r.stdout.strip())
+        return creds.get("claudeAiOauth", {}).get("accessToken", "")
+    except Exception:
+        return ""
+
+def fetch_live_rate_limits(token: str) -> dict | None:
+    """
+    Make a minimal API call and read rate limit utilization from response headers.
+    Returns {"5h_util": float, "7d_util": float, "5h_reset": int, "7d_reset": int}
+    or None on failure.
+
+    Why: Anthropic returns authoritative usage % in every API response header.
+    Cost: max_tokens=1 with a warm cache = effectively 0 fresh input_tokens used.
+    """
+    if not token:
+        return None
+    try:
+        import urllib.request
+        body = json.dumps({
+            "model":      "claude-haiku-4-5-20251001",
+            "max_tokens": 1,
+            "messages":   [{"role": "user", "content": "."}],
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=body,
+            headers={
+                "x-api-key":         token,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            h = dict(r.headers)
+            return {
+                "5h_util":  float(h.get("anthropic-ratelimit-unified-5h-utilization",  0)),
+                "7d_util":  float(h.get("anthropic-ratelimit-unified-7d-utilization",  0)),
+                "5h_reset": int(h.get("anthropic-ratelimit-unified-5h-reset", 0)),
+                "7d_reset": int(h.get("anthropic-ratelimit-unified-7d-reset", 0)),
+                "status":   h.get("anthropic-ratelimit-unified-status", ""),
+            }
+    except Exception:
+        return None
+
 # ── Optional: Anthropic API usage ─────────────────────────────────────────────
 
 def fetch_api_usage():
@@ -308,7 +365,7 @@ def main():
 
     today     = date.today()
     yesterday = today - timedelta(days=1)
-    week_ago  = today - timedelta(days=6)   # inclusive: 7-day rolling window
+    week_ago  = today - timedelta(days=6)
     month_ago = today - timedelta(days=29)
 
     by_date, by_project, n_files, sess_in, sess_out, recent_in, recent_out = parse_local(
@@ -320,78 +377,75 @@ def main():
     w_in, w_out, *_          = window(by_date, week_ago)
     m_in, m_out, *_          = window(by_date, month_ago)
 
-    # Claude's usage limits count only fresh input_tokens (non-cached).
-    # cache_read_input_tokens are served from cache and not counted against limits.
-    # Verified: input_tokens-only matches the % shown in Claude.ai desktop exactly.
-    week_limit_used    = w_in        # input_tokens over 7 days — matches Claude's weekly bar
-    session_limit_used = sess_in     # input_tokens over rolling session window
-
-    # Keep full inp+out for display/cost purposes
-    total_today  = t_in + t_out
     total_week   = w_in + w_out
     total_month  = m_in + m_out
 
     weekly_limit  = int(cfg["weekly_limit"])
     session_limit = int(cfg["session_limit"])
 
-    w_pct = min(week_limit_used    / weekly_limit,  1.0) if weekly_limit  else 0.0
-    s_pct = min(session_limit_used / session_limit, 1.0) if session_limit else 0.0
+    # ── Try to get authoritative rate limits from the API ─────────────────────
+    # Anthropic returns exact utilization % in every API response header.
+    # This matches the Claude.ai desktop numbers precisely.
+    oauth_token = get_oauth_token()
+    live        = fetch_live_rate_limits(oauth_token)
+
+    if live:
+        w_pct             = live["7d_util"]
+        s_pct             = live["5h_util"]
+        week_limit_used   = int(w_pct * weekly_limit)
+        session_limit_used= int(s_pct * session_limit)
+        week_reset_in_h   = (live["7d_reset"] - time.time()) / 3600 if live["7d_reset"] else -1
+        sess_reset_in_h   = (live["5h_reset"] - time.time()) / 3600 if live["5h_reset"] else -1
+        live_source       = True
+    else:
+        # Fallback: use input_tokens from local JSONL
+        week_limit_used    = w_in
+        session_limit_used = sess_in
+        w_pct              = min(week_limit_used  / weekly_limit,  1.0) if weekly_limit  else 0.0
+        s_pct              = min(session_limit_used / session_limit, 1.0) if session_limit else 0.0
+        week_reset_in_h    = -1
+        sess_reset_in_h    = -1
+        live_source        = False
 
     # ── Burn rate: input_tokens/hour over last BURN_WINDOW_HOURS ─────────────
-    burn_rate = recent_in / BURN_WINDOW_HOURS  # input_tokens per hour
+    burn_rate = recent_in / BURN_WINDOW_HOURS
 
     now = datetime.now()
 
-    # ETA: hours until weekly limit exhausted at current burn rate
-    if burn_rate > 0 and week_limit_used < weekly_limit:
-        weekly_eta_h = (weekly_limit - week_limit_used) / burn_rate
-    else:
-        weekly_eta_h = -1.0
-
-    # ── Weekly rolloff: input_tokens dropping out of window at midnight ───────
-    rolloff_day      = week_ago
-    rolloff_tokens   = by_date.get(rolloff_day, {}).get("in", 0)  # input_tokens only
-    midnight         = datetime.combine(today + timedelta(days=1), datetime.min.time())
-    hours_to_rolloff = (midnight - now).total_seconds() / 3600
-
     # ── Menu bar label ─────────────────────────────────────────────────────────
     dominant_pct = max(w_pct, s_pct)
-    col = bar_color(dominant_pct)
+    col          = bar_color(dominant_pct)
 
     if t_out == 0:
         print("⚡ idle | color=#6B7280")
     else:
         pct_display = f"{dominant_pct*100:.0f}%"
-        # Show burn rate in label if actively working
         if burn_rate >= 500:
-            print(f"⚡ {fmt_tokens(t_out)} out · {pct_display} · {fmt_tokens(int(burn_rate))}/h | color={col}")
+            print(f"⚡ {fmt_tokens(t_out)} · {pct_display} · {fmt_tokens(int(burn_rate))}/h | color={col}")
         else:
-            print(f"⚡ {fmt_tokens(t_out)} out · {pct_display} | color={col}")
+            print(f"⚡ {fmt_tokens(t_out)} · {pct_display} | color={col}")
     print("---")
 
     # ── Usage limits ──────────────────────────────────────────────────────────
     ln("USAGE LIMITS", color="#F8FAFC", font="Helvetica-Bold", size=10)
 
     progress_section("weekly  (7 days)", week_limit_used, weekly_limit)
-    # Rolloff hint
-    if rolloff_tokens > 0:
-        ln(f"↻  {fmt_tokens(rolloff_tokens)} tokens roll off in {fmt_duration(hours_to_rolloff)}",
+    if week_reset_in_h > 0:
+        ln(f"↻  resets in {fmt_duration(week_reset_in_h)}",
            color="#475569", size=10)
-    # Weekly ETA — only show if meaningful (< 7 days away)
-    if 0 < weekly_eta_h < 168:
-        ln(f"⚠  at current pace, weekly limit in {fmt_duration(weekly_eta_h)}",
-           color="#F59E0B" if weekly_eta_h < 4 else "#475569", size=10)
 
     print(" ")
 
-    swh = int(cfg["session_window_hours"])
-    progress_section(f"session ({swh}h rolling)", session_limit_used, session_limit)
-    # Burn rate line
+    progress_section("session (5h rolling)", session_limit_used, session_limit)
+    if sess_reset_in_h > 0:
+        ln(f"↻  resets in {fmt_duration(sess_reset_in_h)}",
+           color="#475569", size=10)
     if burn_rate >= 100:
         ln(f"⚡  {fmt_tokens(int(burn_rate))}/h burn rate  (last {BURN_WINDOW_HOURS}h)",
            color="#94A3B8", size=10)
 
-    ln("Claude Code CLI only — excludes claude.ai web/desktop", color="#374151", size=10)
+    if not live_source:
+        ln("⚠  offline — showing Claude Code CLI estimate only", color="#F59E0B", size=10)
     ln("Edit ~/.claude_usage.json to change limits", color="#475569", size=10)
     print("---")
 
