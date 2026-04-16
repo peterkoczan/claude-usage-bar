@@ -242,7 +242,7 @@ def get_oauth_token() -> str:
     except Exception:
         return ""
 
-def fetch_live_rate_limits(token: str) -> dict | None:
+def fetch_live_rate_limits(token: str):
     """
     Make a minimal API call and read rate limit utilization from response headers.
     Returns {"5h_util": float, "7d_util": float, "5h_reset": int, "7d_reset": int}
