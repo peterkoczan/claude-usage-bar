@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # <swiftbar.title>Claude Usage Stats</swiftbar.title>
-# <swiftbar.version>2.0</swiftbar.version>
-# <swiftbar.author>Claude</swiftbar.author>
-# <swiftbar.desc>Track Claude Code sessions with weekly and session progress bars</swiftbar.desc>
+# <swiftbar.version>3.0</swiftbar.version>
+# <swiftbar.author>Peter Koczan</swiftbar.author>
+# <swiftbar.author.github>peterkoczan</swiftbar.author.github>
+# <swiftbar.desc>Claude Code token usage: weekly + session bars, burn rate, rolloff, top projects</swiftbar.desc>
 # <swiftbar.refreshOnOpen>true</swiftbar.refreshOnOpen>
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
 # <swiftbar.environment>[ANTHROPIC_API_KEY=]</swiftbar.environment>
 
 """
-Claude Usage Stats v2 — SwiftBar plugin
+Claude Usage Stats v3 — SwiftBar plugin
 ────────────────────────────────────────
 Shows Claude Code token usage with progress bars matching the
 "Settings → Usage" view in Claude.ai desktop.
@@ -66,7 +67,6 @@ PLAN_DEFAULTS = {
 }
 
 def load_config() -> dict:
-    """Load ~/.claude_usage.json, falling back to Pro defaults."""
     cfg = {
         "plan":                 "pro",
         "weekly_limit":         1_000_000,
@@ -105,6 +105,22 @@ def fmt_cost(inp: int, out: int, cfg: dict) -> str:
     if c < 1.0:    return f"~${c:.3f}"
     return f"~${c:.2f}"
 
+def fmt_duration(hours: float) -> str:
+    """Format a duration in hours as '2h 30m', '1d 4h', etc."""
+    if hours < 0:    return "—"
+    if hours < 1/60: return "< 1m"
+    if hours < 1:    return f"{int(hours * 60)}m"
+    h = int(hours)
+    m = int((hours - h) * 60)
+    if h >= 48:
+        d = h // 24
+        return f"{d}d"
+    if h >= 24:
+        d = h // 24
+        rh = h % 24
+        return f"{d}d {rh}h" if rh else f"{d}d"
+    return f"{h}h {m}m" if m else f"{h}h"
+
 def parse_ts(raw):
     try:
         if isinstance(raw, (int, float)): return datetime.fromtimestamp(raw)
@@ -122,7 +138,6 @@ def bar_color(pct: float) -> str:
     return "#A78BFA"
 
 def make_bar(used: int, limit: int):
-    """Returns (bar_str, pct_float, hex_color)."""
     pct    = min(used / limit, 1.0) if limit > 0 else 0.0
     filled = round(pct * BAR_WIDTH)
     bar    = "\u2588" * filled + "\u2591" * (BAR_WIDTH - filled)
@@ -130,24 +145,39 @@ def make_bar(used: int, limit: int):
 
 # ── Parse local Claude Code sessions ──────────────────────────────────────────
 
+BURN_WINDOW_HOURS = 3  # look back this far to compute burn rate
+
 def parse_local(session_window_hours: float = 5.0):
     """
     Walk ~/.claude/projects/**/*.jsonl.
-    Returns by_date, projects set, file count, session input/output tokens.
-    Session = tokens from the last session_window_hours.
+    Returns:
+      by_date       – {date: {in, out, cache_r, cache_w}}
+      by_project    – {Path: {in, out}}  (all-time per project dir)
+      n_files       – total .jsonl files found
+      sess_in/out   – tokens in the rolling session window
+      recent_in/out – tokens in the last BURN_WINDOW_HOURS (for burn rate)
     """
-    by_date  = defaultdict(lambda: {"in": 0, "out": 0, "cache_r": 0, "cache_w": 0})
-    projects = set()
-    n_files  = 0
-    sess_in  = 0
-    sess_out = 0
-    cutoff   = datetime.now() - timedelta(hours=session_window_hours)
+    by_date    = defaultdict(lambda: {"in": 0, "out": 0, "cache_r": 0, "cache_w": 0})
+    by_project = defaultdict(lambda: {"in": 0, "out": 0})
+    n_files    = 0
+    sess_in = sess_out = 0
+    recent_in = recent_out = 0
+
+    now            = datetime.now()
+    cutoff_sess    = now - timedelta(hours=session_window_hours)
+    cutoff_recent  = now - timedelta(hours=BURN_WINDOW_HOURS)
 
     if not CLAUDE_DIR.exists():
-        return by_date, projects, n_files, sess_in, sess_out
+        return by_date, by_project, n_files, sess_in, sess_out, recent_in, recent_out
 
     for jsonl in CLAUDE_DIR.rglob("*.jsonl"):
-        projects.add(jsonl.parent)
+        # Always attribute tokens to the top-level project dir so that
+        # nested subagent JSONL files roll up into their parent project.
+        try:
+            top_proj = CLAUDE_DIR / jsonl.relative_to(CLAUDE_DIR).parts[0]
+        except (ValueError, IndexError):
+            top_proj = jsonl.parent
+        proj_dir = top_proj
         n_files += 1
         try:
             lines = jsonl.read_text(errors="ignore").splitlines()
@@ -164,7 +194,7 @@ def parse_local(session_window_hours: float = 5.0):
                 continue
 
             ts_raw = msg.get("timestamp") or msg.get("ts") or msg.get("created_at")
-            ts     = parse_ts(ts_raw) if ts_raw else datetime.now()
+            ts     = parse_ts(ts_raw) if ts_raw else now
             d      = ts.date()
 
             usage = msg.get("usage") or {}
@@ -183,11 +213,16 @@ def parse_local(session_window_hours: float = 5.0):
                 by_date[d]["out"]     += out
                 by_date[d]["cache_r"] += cr
                 by_date[d]["cache_w"] += cw
-                if ts >= cutoff:
+                by_project[proj_dir]["in"]  += inp
+                by_project[proj_dir]["out"] += out
+                if ts >= cutoff_sess:
                     sess_in  += inp
                     sess_out += out
+                if ts >= cutoff_recent:
+                    recent_in  += inp
+                    recent_out += out
 
-    return by_date, projects, n_files, sess_in, sess_out
+    return by_date, by_project, n_files, sess_in, sess_out, recent_in, recent_out
 
 # ── Optional: Anthropic API usage ─────────────────────────────────────────────
 
@@ -222,6 +257,35 @@ def window(by_date, start: date, end: date = None):
         d   += timedelta(days=1)
     return inp, out, cr, cw
 
+# ── Project name decoding ─────────────────────────────────────────────────────
+
+def project_name(proj_path: Path) -> str:
+    """
+    Claude encodes project paths by replacing '/' with '-'.
+    e.g. /Users/alice/Developer/my-app → -Users-alice-Developer-my-app
+    We strip the home directory prefix and common parent dirs to get
+    a readable project name like 'my-app' or 'Developer/my-app'.
+    """
+    encoded = proj_path.name
+    home    = str(Path.home()).lstrip("/")          # "Users/alice"
+    prefix  = "-" + home.replace("/", "-") + "-"   # "-Users-alice-"
+
+    home_encoded = "-" + home.replace("/", "-")     # "-Users-alice" (no trailing dash)
+    if encoded == home_encoded:
+        return "~"                                  # sessions run from home directory
+
+    if encoded.startswith(prefix):
+        remainder = encoded[len(prefix):]           # "Developer-my-app"
+        # Strip one common parent dir (Developer, Projects, Code, src, workspace)
+        for skip in ("Developer-", "Projects-", "Code-", "src-", "workspace-", "repos-"):
+            if remainder.startswith(skip):
+                remainder = remainder[len(skip):]
+                break
+        return remainder or encoded
+    # Fallback: strip leading dash, return last two dash-segments for context
+    parts = [p for p in encoded.lstrip("-").split("-") if p]
+    return "-".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else encoded)
+
 # ── SwiftBar output helpers ───────────────────────────────────────────────────
 
 def ln(text: str, **attrs):
@@ -230,12 +294,10 @@ def ln(text: str, **attrs):
     else:
         print(text)
 
-def progress_section(label: str, used: int, limit: int, cfg: dict):
-    """Render a two-line progress block: bar + label with counts."""
+def progress_section(label: str, used: int, limit: int):
     bar, pct, color = make_bar(used, limit)
-    pct_str         = f"{pct*100:.0f}%"
     remaining       = max(limit - used, 0)
-    ln(f"{bar}  {pct_str}", color=color, font="Menlo", size=11)
+    ln(f"{bar}  {pct*100:.0f}%", color=color, font="Menlo", size=11)
     ln(f"{label}   {fmt_tokens(used)} used  ·  {fmt_tokens(remaining)} left  /  {fmt_tokens(limit)}",
        color="#94A3B8", size=11)
 
@@ -246,10 +308,10 @@ def main():
 
     today     = date.today()
     yesterday = today - timedelta(days=1)
-    week_ago  = today - timedelta(days=6)
+    week_ago  = today - timedelta(days=6)   # inclusive: 7-day rolling window
     month_ago = today - timedelta(days=29)
 
-    by_date, projects, n_files, sess_in, sess_out = parse_local(
+    by_date, by_project, n_files, sess_in, sess_out, recent_in, recent_out = parse_local(
         session_window_hours=cfg["session_window_hours"]
     )
 
@@ -258,41 +320,84 @@ def main():
     w_in, w_out, *_          = window(by_date, week_ago)
     m_in, m_out, *_          = window(by_date, month_ago)
 
-    total_today   = t_in + t_out
-    total_week    = w_in + w_out
-    total_session = sess_in + sess_out
-    total_month   = m_in + m_out
+    # Claude's usage limits count only fresh input_tokens (non-cached).
+    # cache_read_input_tokens are served from cache and not counted against limits.
+    # Verified: input_tokens-only matches the % shown in Claude.ai desktop exactly.
+    week_limit_used    = w_in        # input_tokens over 7 days — matches Claude's weekly bar
+    session_limit_used = sess_in     # input_tokens over rolling session window
+
+    # Keep full inp+out for display/cost purposes
+    total_today  = t_in + t_out
+    total_week   = w_in + w_out
+    total_month  = m_in + m_out
 
     weekly_limit  = int(cfg["weekly_limit"])
     session_limit = int(cfg["session_limit"])
 
-    w_pct = min(total_week    / weekly_limit,  1.0) if weekly_limit  else 0.0
-    s_pct = min(total_session / session_limit, 1.0) if session_limit else 0.0
+    w_pct = min(week_limit_used    / weekly_limit,  1.0) if weekly_limit  else 0.0
+    s_pct = min(session_limit_used / session_limit, 1.0) if session_limit else 0.0
+
+    # ── Burn rate: input_tokens/hour over last BURN_WINDOW_HOURS ─────────────
+    burn_rate = recent_in / BURN_WINDOW_HOURS  # input_tokens per hour
+
+    now = datetime.now()
+
+    # ETA: hours until weekly limit exhausted at current burn rate
+    if burn_rate > 0 and week_limit_used < weekly_limit:
+        weekly_eta_h = (weekly_limit - week_limit_used) / burn_rate
+    else:
+        weekly_eta_h = -1.0
+
+    # ── Weekly rolloff: input_tokens dropping out of window at midnight ───────
+    rolloff_day      = week_ago
+    rolloff_tokens   = by_date.get(rolloff_day, {}).get("in", 0)  # input_tokens only
+    midnight         = datetime.combine(today + timedelta(days=1), datetime.min.time())
+    hours_to_rolloff = (midnight - now).total_seconds() / 3600
 
     # ── Menu bar label ─────────────────────────────────────────────────────────
     dominant_pct = max(w_pct, s_pct)
     col = bar_color(dominant_pct)
 
-    if total_today == 0:
+    if t_out == 0:
         print("⚡ idle | color=#6B7280")
     else:
         pct_display = f"{dominant_pct*100:.0f}%"
-        print(f"⚡ {fmt_tokens(total_today)} · {pct_display} | color={col}")
+        # Show burn rate in label if actively working
+        if burn_rate >= 500:
+            print(f"⚡ {fmt_tokens(t_out)} out · {pct_display} · {fmt_tokens(int(burn_rate))}/h | color={col}")
+        else:
+            print(f"⚡ {fmt_tokens(t_out)} out · {pct_display} | color={col}")
     print("---")
 
-    # ── Progress bars ──────────────────────────────────────────────────────────
+    # ── Usage limits ──────────────────────────────────────────────────────────
     ln("USAGE LIMITS", color="#F8FAFC", font="Helvetica-Bold", size=10)
-    progress_section("weekly  (7 days)", total_week, weekly_limit, cfg)
+
+    progress_section("weekly  (7 days)", week_limit_used, weekly_limit)
+    # Rolloff hint
+    if rolloff_tokens > 0:
+        ln(f"↻  {fmt_tokens(rolloff_tokens)} tokens roll off in {fmt_duration(hours_to_rolloff)}",
+           color="#475569", size=10)
+    # Weekly ETA — only show if meaningful (< 7 days away)
+    if 0 < weekly_eta_h < 168:
+        ln(f"⚠  at current pace, weekly limit in {fmt_duration(weekly_eta_h)}",
+           color="#F59E0B" if weekly_eta_h < 4 else "#475569", size=10)
+
     print(" ")
+
     swh = int(cfg["session_window_hours"])
-    progress_section(f"session ({swh}h rolling)", total_session, session_limit, cfg)
-    ln("Edit ~/.claude_usage.json to change limits",
-       color="#475569", size=10)
+    progress_section(f"session ({swh}h rolling)", session_limit_used, session_limit)
+    # Burn rate line
+    if burn_rate >= 100:
+        ln(f"⚡  {fmt_tokens(int(burn_rate))}/h burn rate  (last {BURN_WINDOW_HOURS}h)",
+           color="#94A3B8", size=10)
+
+    ln("Claude Code CLI only — excludes claude.ai web/desktop", color="#374151", size=10)
+    ln("Edit ~/.claude_usage.json to change limits", color="#475569", size=10)
     print("---")
 
-    # ── Today detail ───────────────────────────────────────────────────────────
+    # ── Today detail ──────────────────────────────────────────────────────────
     ln("TODAY", color="#F8FAFC", font="Helvetica-Bold", size=10)
-    if total_today:
+    if t_out:
         ln(f"↑ {fmt_tokens(t_in)} input   ↓ {fmt_tokens(t_out)} output",
            color="#CBD5E1", size=12)
         if t_cr or t_cw:
@@ -300,7 +405,7 @@ def main():
                color="#94A3B8", size=12)
         ln(fmt_cost(t_in, t_out, cfg) + " estimated", color="#86EFAC", size=12)
     else:
-        ln("No activity yet today", color="#64748B", size=12)
+        ln("No activity today", color="#64748B", size=12)
     print("---")
 
     if y_in + y_out:
@@ -324,14 +429,26 @@ def main():
         ln("No activity this month", color="#64748B", size=12)
     print("---")
 
-    ln("CLAUDE CODE", color="#F8FAFC", font="Helvetica-Bold", size=10)
-    if CLAUDE_DIR.exists():
-        ln(f"{len(projects)} project dir(s)   {n_files} session file(s)",
-           color="#94A3B8", size=12)
+    # ── Top projects ──────────────────────────────────────────────────────────
+    ln("PROJECTS", color="#F8FAFC", font="Helvetica-Bold", size=10)
+    if by_project:
+        ranked = sorted(by_project.items(), key=lambda kv: kv[1]["in"] + kv[1]["out"], reverse=True)
+        for proj_path, tok in ranked[:5]:
+            total = tok["in"] + tok["out"]
+            if total == 0:
+                continue
+            name = project_name(proj_path)
+            ln(f"{fmt_tokens(total)}   {name}", color="#94A3B8", size=11)
+        if not CLAUDE_DIR.exists():
+            ln("~/.claude/projects not found", color="#EF4444", size=12)
+        else:
+            ln(f"{len(by_project)} project(s)   {n_files} session file(s)",
+               color="#475569", size=10)
     else:
-        ln("~/.claude/projects not found", color="#EF4444", size=12)
+        ln("No projects found", color="#64748B", size=12)
     print("---")
 
+    # ── Optional API usage ────────────────────────────────────────────────────
     api = fetch_api_usage()
     if api and "_error" not in api:
         data    = api.get("data") or []
@@ -348,7 +465,7 @@ def main():
         ln("Set ANTHROPIC_API_KEY for org-level API usage", color="#64748B", size=11)
         print("---")
 
-    ln(f"Updated {datetime.now().strftime('%H:%M:%S')}   plan: {cfg['plan']}",
+    ln(f"Updated {now.strftime('%H:%M:%S')}   plan: {cfg['plan']}",
        color="#475569", size=10)
     ln("Refresh now", refresh="true", color="#64748B", size=11)
 
