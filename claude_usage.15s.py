@@ -55,9 +55,11 @@ from collections import defaultdict
 
 # ── Paths & env ───────────────────────────────────────────────────────────────
 
-CLAUDE_DIR  = Path.home() / ".claude" / "projects"
-CONFIG_FILE = Path.home() / ".claude_usage.json"
-API_KEY     = os.environ.get("ANTHROPIC_API_KEY", "")
+CLAUDE_DIR   = Path.home() / ".claude" / "projects"
+CONFIG_FILE  = Path.home() / ".claude_usage.json"
+API_KEY      = os.environ.get("ANTHROPIC_API_KEY", "")
+RL_CACHE     = Path("/tmp/claude_usage_rl.json")
+RL_CACHE_TTL = 60   # seconds between live API calls; display still refreshes every 15s
 
 # ── Plan defaults ─────────────────────────────────────────────────────────────
 
@@ -244,15 +246,29 @@ def get_oauth_token() -> str:
 
 def fetch_live_rate_limits(token: str):
     """
-    Make a minimal API call and read rate limit utilization from response headers.
-    Returns {"5h_util": float, "7d_util": float, "5h_reset": int, "7d_reset": int}
-    or None on failure.
+    Return authoritative rate limit utilization from Anthropic response headers.
 
-    Why: Anthropic returns authoritative usage % in every API response header.
-    Cost: max_tokens=1 with a warm cache = effectively 0 fresh input_tokens used.
+    Results are cached to RL_CACHE for RL_CACHE_TTL seconds so the display
+    can refresh every 15 s without hammering the API every 15 s.
+
+    Why a minimal inference call: Anthropic embeds exact utilization % in every
+    API response. Cost at max_tokens=1 with a warm cache ≈ 1 fresh input token
+    per cache-miss (every 60 s), not per display refresh.
     """
     if not token:
         return None
+
+    # ── Cache hit? ────────────────────────────────────────────────────────────
+    now = time.time()
+    try:
+        if RL_CACHE.exists():
+            cached = json.loads(RL_CACHE.read_text())
+            if now - cached.get("ts", 0) < RL_CACHE_TTL:
+                return cached.get("data")
+    except Exception:
+        pass
+
+    # ── Cache miss — call the API ─────────────────────────────────────────────
     try:
         import urllib.request
         body = json.dumps({
@@ -271,13 +287,18 @@ def fetch_live_rate_limits(token: str):
         )
         with urllib.request.urlopen(req, timeout=10) as r:
             h = dict(r.headers)
-            return {
+            data = {
                 "5h_util":  float(h.get("anthropic-ratelimit-unified-5h-utilization",  0)),
                 "7d_util":  float(h.get("anthropic-ratelimit-unified-7d-utilization",  0)),
                 "5h_reset": int(h.get("anthropic-ratelimit-unified-5h-reset", 0)),
                 "7d_reset": int(h.get("anthropic-ratelimit-unified-7d-reset", 0)),
                 "status":   h.get("anthropic-ratelimit-unified-status", ""),
             }
+        try:
+            RL_CACHE.write_text(json.dumps({"ts": now, "data": data}))
+        except Exception:
+            pass
+        return data
     except Exception:
         return None
 
