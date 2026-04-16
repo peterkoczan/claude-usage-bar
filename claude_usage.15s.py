@@ -61,6 +61,9 @@ API_KEY      = os.environ.get("ANTHROPIC_API_KEY", "")
 RL_CACHE     = Path("/tmp/claude_usage_rl.json")
 RL_CACHE_TTL = 60   # seconds between live API calls; display still refreshes every 15s
 
+# Claude app icon (36×36 px, extracted from /Applications/Claude.app)
+CLAUDE_ICON = "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"
+
 # ── Plan defaults ─────────────────────────────────────────────────────────────
 
 PLAN_DEFAULTS = {
@@ -437,14 +440,15 @@ def main():
     dominant_pct = max(w_pct, s_pct)
     col          = bar_color(dominant_pct)
 
+    icon_param = f"image={CLAUDE_ICON}"
     if t_out == 0:
-        print("⚡ idle | color=#6B7280")
+        print(f"idle | color=#6B7280 {icon_param}")
     else:
         pct_display = f"{dominant_pct*100:.0f}%"
         if burn_rate >= 500:
-            print(f"⚡ {fmt_tokens(t_out)} · {pct_display} · {fmt_tokens(int(burn_rate))}/h | color={col}")
+            print(f"{fmt_tokens(t_out)} · {pct_display} · {fmt_tokens(int(burn_rate))}/h | color={col} {icon_param}")
         else:
-            print(f"⚡ {fmt_tokens(t_out)} · {pct_display} | color={col}")
+            print(f"{fmt_tokens(t_out)} · {pct_display} | color={col} {icon_param}")
     print("---")
 
     # ── Usage limits ──────────────────────────────────────────────────────────
@@ -462,7 +466,7 @@ def main():
         ln(f"↻  resets in {fmt_duration(sess_reset_in_h)}",
            color="#475569", size=10)
     if burn_rate >= 100:
-        ln(f"⚡  {fmt_tokens(int(burn_rate))}/h burn rate  (last {BURN_WINDOW_HOURS}h)",
+        ln(f"🔥  {fmt_tokens(int(burn_rate))}/h burn rate  (last {BURN_WINDOW_HOURS}h)",
            color="#94A3B8", size=10)
 
     if not live_source:
