@@ -445,6 +445,33 @@ def do_update():
     except Exception as e:
         print(f"Update failed: {e}", file=sys.stderr)
 
+# ── Refresh interval ─────────────────────────────────────────────────────────
+
+INTERVALS = [
+    ("5s",  "5 seconds"),
+    ("15s", "15 seconds"),
+    ("30s", "30 seconds"),
+    ("1m",  "1 minute"),
+    ("5m",  "5 minutes"),
+    ("15m", "15 minutes"),
+    ("30m", "30 minutes"),
+    ("1h",  "1 hour"),
+]
+
+def current_interval() -> str:
+    m = re.search(r"\.(\d+[smh])\.", Path(__file__).name)
+    return m.group(1) if m else "15s"
+
+def set_refresh_interval(interval: str):
+    """Rename the plugin file to encode the new interval, then rescan SwiftBar."""
+    current = Path(__file__).resolve()
+    new_name = re.sub(r"\.\d+[smh]\.", f".{interval}.", current.name)
+    if new_name == current.name:
+        return
+    new_path = current.parent / new_name
+    current.rename(new_path)
+    subprocess.run(["open", "swiftbar://refreshall"], timeout=5)
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -624,9 +651,25 @@ def main():
        color="#475569", size=10)
     ln("Refresh now", refresh="true", color="#64748B", size=11)
 
+    # ── Refresh interval submenu ──────────────────────────────────────────────
+    active = current_interval()
+    plugin = str(Path(__file__).resolve())
+    ln(f"Refresh every {active}", color="#475569", size=10)
+    for code, label in INTERVALS:
+        mark = "✓ " if code == active else "    "
+        ln(f"--{mark}{label}",
+           bash=plugin,
+           param1="--set-interval",
+           param2=code,
+           terminal="false",
+           color="#94A3B8" if code != active else "#F8FAFC",
+           size=11)
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--update":
         do_update()
+    elif len(sys.argv) > 2 and sys.argv[1] == "--set-interval":
+        set_refresh_interval(sys.argv[2])
     else:
         main()
