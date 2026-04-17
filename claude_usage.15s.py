@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # <swiftbar.title>Claude Usage Stats</swiftbar.title>
-# <swiftbar.version>3.0</swiftbar.version>
+# <swiftbar.version>3.1</swiftbar.version>
 # <swiftbar.author>Peter Koczan</swiftbar.author>
 # <swiftbar.author.github>peterkoczan</swiftbar.author.github>
 # <swiftbar.desc>Claude Code token usage: weekly + session bars, burn rate, rolloff, top projects</swiftbar.desc>
@@ -47,7 +47,9 @@ OPTIONAL - Anthropic API key for org-level usage
 
 import json
 import os
+import re
 import subprocess
+import sys
 import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -60,6 +62,11 @@ CONFIG_FILE  = Path.home() / ".claude_usage.json"
 API_KEY      = os.environ.get("ANTHROPIC_API_KEY", "")
 RL_CACHE     = Path("/tmp/claude_usage_rl.json")
 RL_CACHE_TTL = 60   # seconds between live API calls; display still refreshes every 15s
+
+VERSION      = "3.1"
+GITHUB_RAW   = "https://raw.githubusercontent.com/peterkoczan/claude-usage-bar/main/claude_usage.15s.py"
+VER_CACHE    = Path("/tmp/claude_usage_ver.json")
+VER_CACHE_TTL = 3600  # check for new version once per hour
 
 # Claude app icon (36×36 px, extracted from /Applications/Claude.app)
 CLAUDE_ICON = "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"
@@ -382,6 +389,62 @@ def progress_section(label: str, used: int, limit: int):
     ln(f"{label}   {fmt_tokens(used)} used  ·  {fmt_tokens(remaining)} left  /  {fmt_tokens(limit)}",
        color="#94A3B8", size=11)
 
+# ── Version check ─────────────────────────────────────────────────────────────
+
+def _version_tuple(v: str):
+    try:
+        return tuple(int(x) for x in v.strip().split("."))
+    except Exception:
+        return (0,)
+
+def check_latest_version():
+    """Return (latest_str, is_newer). Uses a 1-hour cache to avoid hammering GitHub."""
+    now = time.time()
+    if VER_CACHE.exists():
+        try:
+            cached = json.loads(VER_CACHE.read_text())
+            if now - cached.get("ts", 0) < VER_CACHE_TTL:
+                latest = cached.get("version", "")
+                return latest, _version_tuple(latest) > _version_tuple(VERSION)
+        except Exception:
+            pass
+    try:
+        result = subprocess.run(
+            ["curl", "-fsSL", "--max-time", "5", GITHUB_RAW],
+            capture_output=True, text=True, timeout=6
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines()[:20]:
+                m = re.search(r"<swiftbar\.version>([\d.]+)</swiftbar\.version>", line)
+                if m:
+                    latest = m.group(1)
+                    VER_CACHE.write_text(json.dumps({"ts": now, "version": latest}))
+                    return latest, _version_tuple(latest) > _version_tuple(VERSION)
+    except Exception:
+        pass
+    return None, False
+
+def do_update():
+    """Download latest version from GitHub, overwrite this script, trigger SwiftBar refresh."""
+    plugin_path = Path(__file__).resolve()
+    try:
+        result = subprocess.run(
+            ["curl", "-fsSL", "--max-time", "30", GITHUB_RAW],
+            capture_output=True, text=True, timeout=35
+        )
+        if result.returncode == 0 and len(result.stdout) > 500:
+            plugin_path.write_text(result.stdout)
+            plugin_path.chmod(0o755)
+            VER_CACHE.unlink(missing_ok=True)  # force re-check on next run
+            subprocess.run(
+                ["open", f"swiftbar://refreshplugin?name={plugin_path.name}"],
+                timeout=5
+            )
+        else:
+            print(f"Update failed (curl exit {result.returncode})", file=sys.stderr)
+    except Exception as e:
+        print(f"Update failed: {e}", file=sys.stderr)
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -544,10 +607,26 @@ def main():
         ln("Set ANTHROPIC_API_KEY for org-level API usage", color="#64748B", size=11)
         print("---")
 
-    ln(f"Updated {now.strftime('%H:%M:%S')}   plan: {cfg['plan']}",
+    # ── Version / update ─────────────────────────────────────────────────────
+    latest_ver, is_newer = check_latest_version()
+    if is_newer and latest_ver:
+        print("---")
+        ln(f"⬆️  Update available: v{latest_ver}  (you have v{VERSION})",
+           color="#F59E0B", font="Helvetica-Bold", size=12)
+        ln(f"   Install v{latest_ver} now — one click, auto-relaunches",
+           bash=str(Path(__file__).resolve()),
+           param1="--update",
+           terminal="false",
+           refresh="true",
+           color="#FCD34D", size=11)
+
+    ln(f"Updated {now.strftime('%H:%M:%S')}   v{VERSION}   plan: {cfg['plan']}",
        color="#475569", size=10)
     ln("Refresh now", refresh="true", color="#64748B", size=11)
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--update":
+        do_update()
+    else:
+        main()
