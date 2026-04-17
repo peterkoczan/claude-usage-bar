@@ -505,13 +505,13 @@ def main():
 
     icon_param = f"image={CLAUDE_ICON}"
     if t_out == 0:
-        print(f"idle | color=#6B7280 {icon_param}")
+        print(f"idle | {icon_param}")
     else:
         pct_display = f"{dominant_pct*100:.0f}%"
         if burn_rate >= 500:
-            print(f"{fmt_tokens(t_out)} · {pct_display} · {fmt_tokens(int(burn_rate))}/h | color={col} {icon_param}")
+            print(f"{fmt_tokens(t_out)} · {pct_display} · {fmt_tokens(int(burn_rate))}/h | {icon_param}")
         else:
-            print(f"{fmt_tokens(t_out)} · {pct_display} | color={col} {icon_param}")
+            print(f"{fmt_tokens(t_out)} · {pct_display} | {icon_param}")
     print("---")
 
     # ── Usage limits ──────────────────────────────────────────────────────────
